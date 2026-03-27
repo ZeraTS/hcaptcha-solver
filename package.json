@@ -5,11 +5,16 @@
   "main": "src/solver.js",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test_solver.js"
+    "test": "node test_solver.js",
+    "test:real": "node test_solver.js --real"
   },
   "dependencies": {
     "jsonwebtoken": "^9.0.2",
     "node-fetch": "^3.3.2",
+    "playwright": "^1.58.2",
+    "playwright-extra": "^4.3.6",
+    "playwright-extra-plugin-stealth": "^0.0.1",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "undici": "^7.24.6"
   },
   "engines": {

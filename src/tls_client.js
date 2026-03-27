@@ -1,160 +1,128 @@
 'use strict';
 
-/**
- * TLS client with Chrome-like fingerprinting.
- * Uses the reqflow sidecar if available, falls back to undici fetch.
- */
-
-const { fetch, Agent } = require('undici');
 const { spawn } = require('child_process');
+const { randomUUID } = require('crypto');
 const path = require('path');
 const fs = require('fs');
-const http = require('http');
 
-const SIDECAR_PATH = path.join(__dirname, '..', 'sidecar', 'reqflow-sidecar');
-const SIDECAR_PORT = 18080 + Math.floor(Math.random() * 100);
+const SIDECAR_BIN = process.env.SIDECAR_PATH ||
+  path.resolve(__dirname, '../sidecar/reqflow-sidecar');
 
-let sidecarProcess = null;
-let sidecarReady = false;
-let usesSidecar = false;
-
-// Chrome-like TLS headers
-const CHROME_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Accept': '*/*',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-  'Sec-Ch-Ua-Mobile': '?0',
-  'Sec-Ch-Ua-Platform': '"Windows"',
-  'Sec-Fetch-Dest': 'empty',
-  'Sec-Fetch-Mode': 'cors',
-  'Sec-Fetch-Site': 'same-site',
-  'Connection': 'keep-alive',
-};
+// Chrome 133 TLS/JA3
+const CHROME_JA3 = '772,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43-27-17513-21,29-23-24,0';
+const CHROME_H2FP = '1:65536,2:0,3:1000,4:6291456,6:262144|15663105|0|m,a,s,p';
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
 
 /**
- * Attempts to start the reqflow sidecar for TLS fingerprinting
+ * Convert a headers object or array-of-pairs to array-of-pairs.
+ * The reqflow-sidecar binary requires headers as [[key, val], ...].
  */
-async function startSidecar() {
-  if (!fs.existsSync(SIDECAR_PATH)) {
-    return false;
+function normalizeHeaders(headers) {
+  if (Array.isArray(headers)) return headers;
+  if (!headers || typeof headers !== 'object') return [];
+  return Object.entries(headers);
+}
+
+class HCaptchaClient {
+  constructor(opts = {}) {
+    this.proc = null;
+    this.pending = new Map();
+    this.buffer = '';
+    this.proxy = opts.proxy || '';
   }
 
-  return new Promise((resolve) => {
-    try {
-      sidecarProcess = spawn(SIDECAR_PATH, ['--port', String(SIDECAR_PORT)], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        detached: false,
-      });
-
-      const timeout = setTimeout(() => resolve(false), 3000);
-
-      sidecarProcess.stdout.on('data', (data) => {
-        if (data.toString().includes('ready') || data.toString().includes('listen')) {
-          clearTimeout(timeout);
-          sidecarReady = true;
-          usesSidecar = true;
-          resolve(true);
-        }
-      });
-
-      sidecarProcess.on('error', () => {
-        clearTimeout(timeout);
-        resolve(false);
-      });
-
-      sidecarProcess.on('exit', () => {
-        sidecarReady = false;
-        usesSidecar = false;
-      });
-
-      // Give it 2s to start
-      setTimeout(() => {
-        if (!sidecarReady) {
-          clearTimeout(timeout);
-          resolve(false);
-        }
-      }, 2000);
-    } catch (e) {
-      resolve(false);
+  start() {
+    if (this.proc) return;
+    if (!fs.existsSync(SIDECAR_BIN)) {
+      throw new Error(`reqflow-sidecar not found at ${SIDECAR_BIN}`);
     }
-  });
-}
-
-/**
- * Makes a request via the reqflow sidecar
- */
-async function sidecarFetch(url, options = {}) {
-  const proxyUrl = `http://127.0.0.1:${SIDECAR_PORT}`;
-  const agent = new Agent({
-    connect: {
-      rejectUnauthorized: false,
-    }
-  });
-
-  return fetch(url, {
-    ...options,
-    dispatcher: agent,
-  });
-}
-
-/**
- * Main HTTP client function
- */
-async function tlsFetch(url, options = {}) {
-  const headers = {
-    ...CHROME_HEADERS,
-    ...(options.headers || {}),
-  };
-
-  const fetchOptions = {
-    method: options.method || 'GET',
-    headers,
-  };
-
-  if (options.body) {
-    fetchOptions.body = options.body;
+    this.proc = spawn(SIDECAR_BIN, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.proc.stdout.on('data', chunk => {
+      this.buffer += chunk.toString();
+      const lines = this.buffer.split('\n');
+      this.buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const resp = JSON.parse(line);
+          const p = this.pending.get(resp.id);
+          if (p) { this.pending.delete(resp.id); p.resolve(resp); }
+        } catch (e) {}
+      }
+    });
+    this.proc.stderr.on('data', d => {
+      const s = d.toString().trim();
+      if (s) process.stderr.write('[hcaptcha-sidecar] ' + s + '\n');
+    });
+    this.proc.on('exit', code => {
+      for (const [, p] of this.pending) p.reject(new Error('sidecar exited: ' + code));
+      this.pending.clear();
+      this.proc = null;
+    });
   }
 
-  if (usesSidecar && sidecarReady) {
-    try {
-      return await sidecarFetch(url, fetchOptions);
-    } catch (e) {
-      // Fall through to regular fetch
-    }
+  stop() {
+    if (this.proc) { try { this.proc.kill(); } catch(e) {} this.proc = null; }
   }
 
-  return fetch(url, fetchOptions);
-}
-
-/**
- * Initialize the TLS client (try to start sidecar)
- */
-async function init() {
-  const started = await startSidecar();
-  if (started) {
-    console.log(`[tls_client] reqflow sidecar started on port ${SIDECAR_PORT}`);
-  } else {
-    console.log('[tls_client] Using standard fetch (no TLS fingerprinting sidecar)');
+  _request(opts, timeoutMs = 30000) {
+    if (!this.proc) this.start();
+    return new Promise((resolve, reject) => {
+      const id = randomUUID();
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error('sidecar request timeout'));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (r) => { clearTimeout(timer); resolve(r); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+      const req = {
+        id,
+        action: 'request',
+        method: opts.method || 'GET',
+        url: opts.url,
+        headers: normalizeHeaders(opts.headers),
+        body: opts.body || '',
+        proxy: opts.proxy || this.proxy || '',
+        browser: 'chrome',
+        ja3: CHROME_JA3,
+        http2fp: CHROME_H2FP,
+        disable_http3: false,
+        follow_redirects: true,
+        max_redirects: 10,
+        timeout: timeoutMs,
+      };
+      this.proc.stdin.write(JSON.stringify(req) + '\n');
+    });
   }
-  return started;
-}
 
-/**
- * Clean up sidecar process
- */
-function cleanup() {
-  if (sidecarProcess) {
-    try {
-      sidecarProcess.kill();
-    } catch (e) {}
-    sidecarProcess = null;
+  async get(url, headers = {}, proxy = '') {
+    return this._request({ method: 'GET', url, headers, body: '', proxy });
+  }
+
+  async post(url, body, headers = {}, proxy = '') {
+    // body should be a string (URL-encoded)
+    const bodyStr = typeof body === 'string' ? body :
+      (Buffer.isBuffer(body) ? body.toString('utf8') : String(body));
+    const mergedHeaders = { 'Content-Type': 'application/x-www-form-urlencoded', ...headers };
+    return this._request({ method: 'POST', url, headers: mergedHeaders, body: bodyStr, proxy });
+  }
+
+  async postJson(url, body, headers = {}, proxy = '') {
+    const bodyStr = typeof body === 'string' ? body : JSON.stringify(body);
+    const mergedHeaders = { 'Content-Type': 'application/json', ...headers };
+    return this._request({ method: 'POST', url, headers: mergedHeaders, body: bodyStr, proxy });
+  }
+
+  /**
+   * Parse body from sidecar response.
+   * The sidecar returns body as a plain string (not base64).
+   */
+  static decodeBody(r) {
+    if (r.error) throw new Error('sidecar error: ' + r.error);
+    return r.body || '';
   }
 }
 
-process.on('exit', cleanup);
-process.on('SIGINT', () => { cleanup(); process.exit(0); });
-process.on('SIGTERM', () => { cleanup(); process.exit(0); });
-
-module.exports = { tlsFetch, init, cleanup, CHROME_HEADERS };
+module.exports = { HCaptchaClient, USER_AGENT };
