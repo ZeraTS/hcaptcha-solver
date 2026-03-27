@@ -9,12 +9,14 @@
     "test:real": "node test_solver.js --real"
   },
   "dependencies": {
+    "@xenova/transformers": "^2.17.2",
     "jsonwebtoken": "^9.0.2",
     "node-fetch": "^3.3.2",
     "playwright": "^1.58.2",
     "playwright-extra": "^4.3.6",
     "playwright-extra-plugin-stealth": "^0.0.1",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "sharp": "^0.33.5",
     "undici": "^7.24.6"
   },
   "engines": {

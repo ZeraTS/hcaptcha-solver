@@ -5,7 +5,6 @@ const { HCaptchaClient, USER_AGENT } = require('./tls_client');
 const { solvePoW } = require('./pow');
 const { generateMotionData, generateAnswerMotionData } = require('./motion');
 const { BrowserSession } = require('./browser_session');
-const { classifyImages } = require('./image_solver');
 
 const HCAPTCHA_API_DOMAIN = 'https://hcaptcha.com';
 const ASSET_DOMAIN = 'https://newassets.hcaptcha.com';
@@ -85,8 +84,6 @@ class HCaptchaSolver {
     this.timeout = options.timeout || 90000;
     this.debug = options.debug || false;
     this.proxy = options.proxy || '';
-    this.anthropicApiKey = options.anthropicApiKey || process.env.ANTHROPIC_API_KEY || '';
-    this.useVision = options.useVision !== false; // default true
     this.client = new HCaptchaClient({ proxy: this.proxy });
     this._browser = null;
   }
@@ -181,27 +178,9 @@ class HCaptchaSolver {
 
     this.log(`${taskList.length} tasks, type: ${jobMode}`);
 
-    // Solve images if we have them
+    // Default answers — browser path handles vision via CLIP
     let answers = {};
-    if (taskList.length > 0 && this.useVision && this.anthropicApiKey) {
-      this.log('Classifying images with vision AI...');
-      const question = captchaData.requester_question && captchaData.requester_question.en
-        ? captchaData.requester_question.en
-        : jobMode;
-      try {
-        answers = await classifyImages(taskList, jobMode, question, {
-          backend: 'claude',
-          apiKey: this.anthropicApiKey,
-        });
-        this.log('Vision answers:', JSON.stringify(answers).slice(0, 100));
-      } catch (e) {
-        this.log('Vision classify failed, using random:', e.message);
-        answers = {};
-        for (const t of taskList) if (t.task_key) answers[t.task_key] = 'true';
-      }
-    } else {
-      for (const t of taskList) if (t.task_key) answers[t.task_key] = 'true';
-    }
+    for (const t of taskList) if (t.task_key) answers[t.task_key] = 'true';
 
     const motionData2 = generateAnswerMotionData(taskList.length);
     const checkData = await checkCaptcha(
@@ -223,7 +202,6 @@ class HCaptchaSolver {
       this._browser = new BrowserSession({
         debug: this.debug,
         proxy: this.proxy,
-        anthropicApiKey: this.anthropicApiKey,
       });
     }
 
