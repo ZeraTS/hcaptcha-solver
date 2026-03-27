@@ -1,0 +1,5 @@
+node_modules/
+*.log
+hsw.js
+hsw_real.js
+.env

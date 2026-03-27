@@ -1,0 +1,21 @@
+{
+  "name": "hcaptcha-solver",
+  "version": "1.0.0",
+  "description": "hCaptcha PoW solver that returns P1_ tokens via HSL hashcash",
+  "main": "src/solver.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test_solver.js"
+  },
+  "dependencies": {
+    "jsonwebtoken": "^9.0.2",
+    "node-fetch": "^3.3.2",
+    "undici": "^7.24.6"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "keywords": [],
+  "author": ""
+}
