@@ -126,6 +126,18 @@ async function runHswInVm(code, reqJwt) {
       CustomEvent: function (type, opts) { return { type, detail: opts && opts.detail }; },
       atob,
       btoa,
+      eval: (code) => { try { return vm.runInNewContext(code, sandbox); } catch(e) { return undefined; } },
+      Function: Function,
+      // Globals accessed via window["Number"], window["String"], etc.
+      Number, String, Boolean, Object, Array, RegExp, Date, Symbol,
+      Map, Set, WeakMap, WeakSet,
+      Error, TypeError, RangeError, SyntaxError, EvalError, URIError,
+      Math, JSON, Promise,
+      parseInt, parseFloat, isNaN, isFinite, encodeURIComponent, decodeURIComponent,
+      Uint8Array, Int8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array,
+      Float32Array, Float64Array, ArrayBuffer, DataView,
+      URL, URLSearchParams,
+      TextEncoder, TextDecoder,
     }, {
       get: (target, prop) => {
         if (prop in target) return target[prop];
@@ -174,10 +186,14 @@ async function runHswInVm(code, reqJwt) {
       devicePixelRatio: 1,
       innerWidth: 1920,
       innerHeight: 1080,
+      URL,
+      URLSearchParams,
+      // Pass the real Node.js Function constructor so new Function(...) works inside the VM
+      Function: Function,
+      eval: (code) => { try { return vm.runInNewContext(code, sandbox); } catch(e) { return undefined; } },
     };
 
-    eval: (code) => { try { return vm.runInNewContext(code, sandbox); } catch(e) { return undefined; } },
-  sandbox.global = sandbox;
+    sandbox.global = sandbox;
     sandbox.globalThis = sandbox;
 
     try {
