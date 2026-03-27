@@ -4,12 +4,12 @@ const { fetch } = require('undici');
 const { HCaptchaClient, USER_AGENT } = require('./tls_client');
 const { solvePoW } = require('./pow');
 const { generateMotionData, generateAnswerMotionData } = require('./motion');
+const { BrowserSession } = require('./browser_session');
+const { classifyImages } = require('./image_solver');
 
-// hCaptcha API constants
 const HCAPTCHA_API_DOMAIN = 'https://hcaptcha.com';
 const ASSET_DOMAIN = 'https://newassets.hcaptcha.com';
 
-// Current hCaptcha widget version — fetched dynamically or cached
 let cachedVersion = null;
 
 const CHROME_HEADERS = {
@@ -25,275 +25,217 @@ const CHROME_HEADERS = {
   'Sec-Fetch-Site': 'same-site',
 };
 
-/**
- * Fetches the current hCaptcha widget version from api.js
- * Uses undici fetch — low-risk CDN call
- */
 async function getVersion() {
   if (cachedVersion) return cachedVersion;
-
   const resp = await fetch('https://js.hcaptcha.com/1/api.js', {
-    headers: {
-      'User-Agent': USER_AGENT,
-      'Accept': '*/*',
-      'Referer': 'https://hcaptcha.com/',
-    }
+    headers: { 'User-Agent': USER_AGENT, 'Accept': '*/*', 'Referer': 'https://hcaptcha.com/' }
   });
-
   const text = await resp.text();
   const match = text.match(/captcha\/v1\/([a-f0-9]+)/);
   if (!match) throw new Error('Could not extract hCaptcha version from api.js');
-
   cachedVersion = match[1];
   return cachedVersion;
 }
 
-/**
- * Step 1: Fetch site config and PoW challenge
- * Uses undici fetch — low-risk CDN call
- * URL: GET https://hcaptcha.com/checksiteconfig?v={version}&host={host}&sitekey={sitekey}&sc=1&swa=1&spst=0
- */
 async function checkSiteConfig(sitekey, host, version) {
   const url = `${HCAPTCHA_API_DOMAIN}/checksiteconfig?v=${version}&host=${host}&sitekey=${sitekey}&sc=1&swa=1&spst=0`;
-
   const resp = await fetch(url, {
-    headers: {
-      ...CHROME_HEADERS,
-      'Origin': `https://${host}`,
-      'Referer': `https://${host}/`,
-    }
+    headers: { ...CHROME_HEADERS, 'Origin': `https://${host}`, 'Referer': `https://${host}/` }
   });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`checksiteconfig failed: ${resp.status} - ${text.slice(0, 200)}`);
-  }
-
+  if (!resp.ok) throw new Error(`checksiteconfig failed: ${resp.status}`);
   return resp.json();
 }
 
-/**
- * Step 2: POST to getcaptcha via TLS client
- * URL: POST https://hcaptcha.com/getcaptcha/{sitekey}
- * Body (form-encoded): v=...&sitekey=...&host=...&hl=en&motionData=...&pdc=...&n={pow_token}&c={challenge_json}
- */
 async function getCaptcha(client, sitekey, host, version, powProof, challengeSpec, motionData) {
   const url = `${HCAPTCHA_API_DOMAIN}/getcaptcha/${sitekey}`;
-
   const body = new URLSearchParams({
-    v: version,
-    sitekey,
-    host,
-    hl: 'en',
-    motionData,
+    v: version, sitekey, host, hl: 'en', motionData,
     n: powProof || '',
     c: JSON.stringify(challengeSpec),
     pdc: JSON.stringify({ s: Date.now(), n: 0, p: 0, gcs: 10 }),
   });
-
-  const headers = {
-    ...CHROME_HEADERS,
-    'Origin': `https://${host}`,
-    'Referer': `https://${host}/`,
-  };
-
+  const headers = { ...CHROME_HEADERS, 'Origin': `https://${host}`, 'Referer': `https://${host}/` };
   const r = await client.post(url, body.toString(), headers);
-
-  if (r.error) {
-    throw new Error(`getcaptcha sidecar error: ${r.error}`);
-  }
-  if (r.status && r.status >= 400) {
-    const text = r.body || '';
-    throw new Error(`getcaptcha failed: ${r.status} - ${text.slice(0, 200)}`);
-  }
-
-  const text = r.body || '';
-  return JSON.parse(text);
+  if (r.error) throw new Error(`getcaptcha sidecar error: ${r.error}`);
+  if (r.status >= 400) throw new Error(`getcaptcha failed: ${r.status}`);
+  return JSON.parse(r.body || '{}');
 }
 
-/**
- * Step 3: POST to checkcaptcha with answers via TLS client
- * URL: POST https://hcaptcha.com/checkcaptcha/{sitekey}/{key}
- * Body (JSON): {answers, c, n, ...}
- */
 async function checkCaptcha(client, sitekey, host, version, sessionKey, answers, motionData, challengeSpec, powProof) {
   const url = `${HCAPTCHA_API_DOMAIN}/checkcaptcha/${sitekey}/${sessionKey}`;
-
   const bodyObj = {
-    v: version,
-    sitekey,
+    v: version, sitekey,
     c: JSON.stringify(challengeSpec),
     job_mode: challengeSpec.type || 'image_label_binary',
-    host,
-    answers,
-    motionData,
+    host, answers, motionData,
     n: powProof || '',
     pdc: { s: Date.now(), n: 0, p: 0, gcs: 10 },
   };
-
-  const headers = {
-    ...CHROME_HEADERS,
-    'Origin': `https://${host}`,
-    'Referer': `https://${host}/`,
-  };
-
+  const headers = { ...CHROME_HEADERS, 'Origin': `https://${host}`, 'Referer': `https://${host}/` };
   const r = await client.postJson(url, bodyObj, headers);
-
-  if (r.error) {
-    throw new Error(`checkcaptcha sidecar error: ${r.error}`);
-  }
-  if (r.status && r.status >= 400) {
-    const text = r.body || '';
-    throw new Error(`checkcaptcha failed: ${r.status} - ${text.slice(0, 200)}`);
-  }
-
-  const text = r.body || '';
-  return JSON.parse(text);
-}
-
-/**
- * Builds the answers object for image tasks
- * Uses 'true' for all tasks (random pass attempt — placeholder for real image solving)
- */
-function buildAnswers(taskList) {
-  const answers = {};
-  if (!taskList || taskList.length === 0) return answers;
-  for (const task of taskList) {
-    if (task.task_key) {
-      answers[task.task_key] = 'true';
-    }
-  }
-  return answers;
+  if (r.error) throw new Error(`checkcaptcha sidecar error: ${r.error}`);
+  if (r.status >= 400) throw new Error(`checkcaptcha failed: ${r.status}`);
+  return JSON.parse(r.body || '{}');
 }
 
 class HCaptchaSolver {
   constructor(options = {}) {
     this.sitekey = options.sitekey || '4c672d35-0701-42b2-88c3-78380b0db560';
     this.host = options.host || 'accounts.hcaptcha.com';
-    this.timeout = options.timeout || 60000;
+    this.timeout = options.timeout || 90000;
     this.debug = options.debug || false;
     this.proxy = options.proxy || '';
+    this.anthropicApiKey = options.anthropicApiKey || process.env.ANTHROPIC_API_KEY || '';
+    this.useVision = options.useVision !== false; // default true
     this.client = new HCaptchaClient({ proxy: this.proxy });
+    this._browser = null;
   }
 
   log(...args) {
-    if (this.debug) {
-      console.log('[hcaptcha]', ...args);
-    }
+    if (this.debug) console.log('[hcaptcha]', ...args);
   }
 
   close() {
     this.client.stop();
+    if (this._browser) { this._browser.close().catch(() => {}); this._browser = null; }
   }
 
   /**
-   * Main solve function
-   * @param {string} sitekey - Override sitekey (optional)
-   * @param {string} host - Override host (optional)
-   * Returns the P1_... or P2_... token string
+   * Solve hCaptcha for a given sitekey + host.
+   *
+   * Strategy:
+   *   1. Try pure-HTTP path (fast, works for test sitekey and any non-enc_get_req sitekey)
+   *   2. If getcaptcha returns client-fail or enc_get_req, fall back to browser path
+   *   3. Browser handles PoW + fingerprint + enc_get_req encryption
+   *   4. If browser gets image challenge, extract images and classify with vision AI
+   *
+   * Returns: { token: string, elapsed: number, type: string }
    */
   async solve(sitekey, host) {
     const startTime = Date.now();
     const sk = sitekey || this.sitekey;
     const h = host || this.host;
 
-    // Get widget version
-    this.log('Fetching widget version...');
+    this.log('Fetching version...');
     const version = await getVersion();
     this.log('Version:', version);
 
-    // Step 1: checksiteconfig — get PoW challenge (undici, low-risk CDN)
+    // Step 1: checksiteconfig
     this.log('Checking site config...');
     const siteConfig = await checkSiteConfig(sk, h, version);
-    this.log('Site config:', JSON.stringify(siteConfig).slice(0, 200));
+    this.log('Site config:', JSON.stringify(siteConfig).slice(0, 150));
 
-    if (!siteConfig.pass) {
-      throw new Error(`Site config check failed: ${JSON.stringify(siteConfig)}`);
+    if (!siteConfig.pass) throw new Error(`Site config failed: ${JSON.stringify(siteConfig)}`);
+
+    // Check if this is a test/easy sitekey (no PoW, no enc_get_req)
+    const hasPoW = siteConfig.c && siteConfig.c.req;
+    const hasEncGetReq = siteConfig.features && siteConfig.features.enc_get_req;
+
+    if (!hasEncGetReq) {
+      // Pure-HTTP path — handles test sitekey and any plaintext sitekey
+      this.log('Pure-HTTP path (no enc_get_req)');
+      return this._solveHTTP(sk, h, version, siteConfig, startTime);
     }
 
+    // enc_get_req is on — must use browser path
+    this.log('Browser path (enc_get_req=true)');
+    return this._solveBrowser(sk, h, startTime);
+  }
+
+  async _solveHTTP(sk, h, version, siteConfig, startTime) {
     const configChallenge = siteConfig.c;
     let configPowProof = null;
 
     if (configChallenge && configChallenge.req) {
-      // Solve PoW from checksiteconfig
-      this.log('Solving config PoW challenge...');
+      this.log('Solving config PoW...');
       configPowProof = await solvePoW(configChallenge.req, ASSET_DOMAIN);
-      this.log('Config PoW proof:', configPowProof ? configPowProof.slice(0, 80) + '...' : 'null');
-    } else {
-      this.log('No PoW challenge in site config (pre-approved or test key) — skipping PoW');
+      this.log('Config PoW solved');
     }
 
-    // Step 2: getcaptcha — submit PoW proof, get challenge or immediate pass (TLS client)
-    this.log('Fetching captcha challenge...');
     const motionData1 = generateMotionData();
     const captchaData = await getCaptcha(
       this.client, sk, h, version,
       configPowProof, configChallenge || {}, motionData1
     );
-    this.log('Captcha data:', JSON.stringify(captchaData).slice(0, 300));
+    this.log('Captcha data:', JSON.stringify(captchaData).slice(0, 200));
 
-    // Check for immediate pass (no image challenge needed)
     if (captchaData.generated_pass_UUID) {
-      this.log('Got immediate pass token!');
-      return {
-        token: captchaData.generated_pass_UUID,
-        elapsed: Date.now() - startTime,
-        type: 'immediate',
-      };
+      return { token: captchaData.generated_pass_UUID, elapsed: Date.now() - startTime, type: 'immediate' };
     }
 
-    // getcaptcha returns a NEW PoW challenge for checkcaptcha
     const captchaChallenge = captchaData.c;
     if (!captchaChallenge || !captchaChallenge.req) {
-      throw new Error(`No challenge spec in getcaptcha response: ${JSON.stringify(captchaData).slice(0, 200)}`);
+      // Client-fail or enc_get_req response — escalate to browser
+      this.log('HTTP path got non-standard response, falling back to browser');
+      return this._solveBrowser(sk, h, startTime);
     }
 
-    // Solve the new PoW challenge from getcaptcha
-    this.log('Solving captcha PoW challenge...');
+    this.log('Solving captcha PoW...');
     const captchaPowProof = await solvePoW(captchaChallenge.req, ASSET_DOMAIN);
-    this.log('Captcha PoW proof:', captchaPowProof ? captchaPowProof.slice(0, 80) + '...' : 'null');
 
-    // Answer image challenge
     const sessionKey = captchaData.key;
     const taskList = captchaData.tasklist || [];
     const jobMode = captchaData.request_type || 'image_label_binary';
 
-    if (!sessionKey) {
-      throw new Error(`No session key in captcha response: ${JSON.stringify(captchaData).slice(0, 200)}`);
+    if (!sessionKey) throw new Error(`No session key: ${JSON.stringify(captchaData).slice(0, 200)}`);
+
+    this.log(`${taskList.length} tasks, type: ${jobMode}`);
+
+    // Solve images if we have them
+    let answers = {};
+    if (taskList.length > 0 && this.useVision && this.anthropicApiKey) {
+      this.log('Classifying images with vision AI...');
+      const question = captchaData.requester_question && captchaData.requester_question.en
+        ? captchaData.requester_question.en
+        : jobMode;
+      try {
+        answers = await classifyImages(taskList, jobMode, question, {
+          backend: 'claude',
+          apiKey: this.anthropicApiKey,
+        });
+        this.log('Vision answers:', JSON.stringify(answers).slice(0, 100));
+      } catch (e) {
+        this.log('Vision classify failed, using random:', e.message);
+        answers = {};
+        for (const t of taskList) if (t.task_key) answers[t.task_key] = 'true';
+      }
+    } else {
+      for (const t of taskList) if (t.task_key) answers[t.task_key] = 'true';
     }
 
-    this.log(`Got ${taskList.length} tasks, type: ${jobMode}`);
-
-    // Build answers (answer 'true' to all — placeholder for real image solving)
-    const answers = buildAnswers(taskList);
-    this.log('Answers:', JSON.stringify(answers).slice(0, 100));
-
-    // Step 3: checkcaptcha — submit answers with new PoW proof (TLS client)
-    this.log('Submitting answers...');
     const motionData2 = generateAnswerMotionData(taskList.length);
-
     const checkData = await checkCaptcha(
       this.client, sk, h, version,
       sessionKey, answers, motionData2,
       captchaChallenge, captchaPowProof
     );
-    this.log('Check result:', JSON.stringify(checkData).slice(0, 200));
+    this.log('Check result:', JSON.stringify(checkData).slice(0, 150));
 
     if (checkData.generated_pass_UUID) {
-      return {
-        token: checkData.generated_pass_UUID,
-        elapsed: Date.now() - startTime,
-        type: 'image_solved',
-      };
+      return { token: checkData.generated_pass_UUID, elapsed: Date.now() - startTime, type: 'image_solved' };
+    }
+    if (checkData.pass === false) throw new Error(`Captcha failed: ${JSON.stringify(checkData)}`);
+    throw new Error(`Unexpected: ${JSON.stringify(checkData).slice(0, 200)}`);
+  }
+
+  async _solveBrowser(sk, h, startTime) {
+    if (!this._browser) {
+      this._browser = new BrowserSession({
+        debug: this.debug,
+        proxy: this.proxy,
+        anthropicApiKey: this.anthropicApiKey,
+      });
     }
 
-    if (checkData.pass === false) {
-      throw new Error(`Captcha failed: ${JSON.stringify(checkData)}`);
+    this.log('Starting browser session...');
+    const result = await this._browser.solve(sk, h);
+
+    if (result.token) {
+      return { token: result.token, elapsed: Date.now() - startTime, type: result.type || 'browser_solved' };
     }
 
-    throw new Error(`Unexpected response: ${JSON.stringify(checkData).slice(0, 200)}`);
+    throw new Error('Browser solve failed: no token returned. Set ANTHROPIC_API_KEY for vision-based challenge solving.');
   }
 }
 
-// Export for direct use
 module.exports = { HCaptchaSolver, getVersion, checkSiteConfig, getCaptcha, checkCaptcha };
