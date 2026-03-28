@@ -1,20 +1,5 @@
 'use strict';
 
-/**
- * a11y_browser_solver.js — Solve hCaptcha via accessibility text challenges using Playwright.
- *
- * Flow:
- *   1. Navigate to page with hCaptcha widget
- *   2. Click checkbox to trigger challenge
- *   3. Open info menu → click "Accessibility Challenge"
- *   4. Parse the text question from the DOM
- *   5. Compute answer programmatically
- *   6. Type answer into input field
- *   7. Submit and capture token
- *
- * No image classification. No cookies. Works on any enterprise site with a11y_challenge:true.
- */
-
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth');
 const { solveTextChallenge } = require('./text_solver');
@@ -31,245 +16,216 @@ class A11yBrowserSolver {
   }
 
   log(...args) {
-    if (this.debug) console.log('[a11y-browser]', ...args);
+    if (this.debug) console.log('[a11y]', ...args);
   }
 
   async _ensureBrowser() {
     if (this._browser) return;
-    const launchOpts = {
+    this._browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    };
-    if (this.proxy) {
-      launchOpts.proxy = { server: this.proxy, bypass: '127.0.0.1,localhost' };
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    });
+  }
+
+  async _poll(fn, timeoutMs = 8000, interval = 150) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try { const r = await fn(); if (r) return r; } catch {}
+      await new Promise(r => setTimeout(r, interval));
     }
-    this._browser = await chromium.launch(launchOpts);
-    this.log('Browser launched');
+    return null;
   }
 
   async solve(sitekey, host, opts = {}) {
-    const startTime = Date.now();
+    const t0 = Date.now();
     await this._ensureBrowser();
 
     const pageUrl = opts.pageUrl || `https://accounts.hcaptcha.com/demo?sitekey=${encodeURIComponent(sitekey)}`;
-    this.log(`Solving sitekey=${sitekey} url=${pageUrl}`);
 
     const ctx = await this._browser.newContext({
-      userAgent: UA,
-      viewport: { width: 1366, height: 768 },
-      locale: 'en-US',
-      timezoneId: 'America/New_York',
+      userAgent: UA, viewport: { width: 1366, height: 768 }, locale: 'en-US',
     });
-
     const page = await ctx.newPage();
-    let capturedToken = null;
+    let token = null;
 
-    // Intercept responses for token
     page.on('response', async resp => {
+      if (token) return;
       if (!resp.url().includes('/getcaptcha/') && !resp.url().includes('/checkcaptcha/')) return;
       try {
         const body = await resp.body();
         if (body[0] === 0x7b) {
-          const data = JSON.parse(body.toString());
-          if (data.generated_pass_UUID && !capturedToken) {
-            capturedToken = data.generated_pass_UUID;
-            this.log('Token captured:', capturedToken.slice(0, 40));
-          }
+          const d = JSON.parse(body.toString());
+          if (d.generated_pass_UUID) token = d.generated_pass_UUID;
         }
-      } catch (e) {}
+      } catch {}
     });
 
     try {
-      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 12000 });
 
-      // Wait for checkbox frame
-      let cbf = null;
-      for (let i = 0; i < 20; i++) {
-        await page.waitForTimeout(400);
-        cbf = page.frames().find(f => f.url().includes('frame=checkbox'));
-        if (cbf) break;
-      }
-      if (!cbf) throw new Error('Checkbox frame not found');
-
-      // Click checkbox
-      await cbf.waitForSelector('#checkbox', { timeout: 6000 });
-      this.log('Clicking checkbox');
-      await page.waitForTimeout(400 + Math.random() * 300);
+      // Wait for and click checkbox
+      const cbf = await this._poll(() =>
+        page.frames().find(f => f.url().includes('frame=checkbox')) || null, 8000);
+      if (!cbf) throw new Error('No checkbox frame');
+      await cbf.waitForSelector('#checkbox', { timeout: 4000 });
+      await page.waitForTimeout(200);
       await cbf.click('#checkbox');
-      await page.waitForTimeout(4000);
+      this.log('Checkbox', Date.now() - t0, 'ms');
 
-      // Get challenge iframe position
-      const iframeEl = await page.$('iframe[src*="frame=challenge"]');
-      if (!iframeEl) throw new Error('Challenge iframe not found');
+      // Wait for challenge iframe
+      const iframeEl = await this._poll(() => page.$('iframe[src*="frame=challenge"]'), 6000);
+      if (!iframeEl) throw new Error('No challenge iframe');
       const bb = await iframeEl.boundingBox();
-      if (!bb) throw new Error('No iframe bounding box');
 
-      // Also inject token capture via postMessage
+      // Give hCaptcha time to fully render the challenge
+      await page.waitForTimeout(2000);
+
+      // Wait for challenge to load
+      await this._poll(() => {
+        const cf = page.frames().find(f => f.url().includes('frame=challenge'));
+        return cf?.evaluate(() => {
+          const p = document.querySelector('.prompt-text');
+          const c = document.querySelector('canvas');
+          return (p?.textContent?.trim()) || (c?.offsetHeight > 0) || null;
+        });
+      }, 8000, 200);
+      this.log('Challenge loaded', Date.now() - t0, 'ms');
+
+      // Inject token capture
       await page.evaluate(() => {
         window.__hcToken = null;
-        window.addEventListener('message', (e) => {
+        window.addEventListener('message', e => {
           try {
             const d = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
-            if (d?.source === 'hcaptcha' && d.label === 'challenge-passed') {
+            if (d?.source === 'hcaptcha' && d.label === 'challenge-passed')
               window.__hcToken = d.contents?.response || d.response;
-            }
-          } catch (_) {}
+          } catch {}
         });
       });
 
-      // Retry loop — solve up to 3 text challenges
-      for (let attempt = 0; attempt < 5; attempt++) {
-        this.log(`\nAttempt ${attempt + 1}/5`);
-
-        if (attempt === 0) {
-          // First attempt: open the accessibility menu
-          this.log('Opening accessibility menu...');
-          await page.mouse.click(bb.x + 27, bb.y + 540);
-          await page.waitForTimeout(1200);
-
-          this.log('Clicking Accessibility Challenge...');
-          await page.mouse.click(bb.x + 135, bb.y + 352);
-          await page.waitForTimeout(4000);
-        } else {
-          // Subsequent attempts: we're already on text challenge, just wait for new question
-          this.log('Waiting for new text challenge...');
-          await page.waitForTimeout(3000);
-        }
-
-        // Check if we got a token already (some sites auto-pass on a11y)
-        if (capturedToken) break;
-        const pmToken = await page.evaluate(() => window.__hcToken).catch(() => null);
-        if (pmToken) { capturedToken = pmToken; break; }
-
-        // Read the text challenge from the DOM
-        const cf = page.frames().find(f => f.url().includes('frame=challenge'));
-        if (!cf) { this.log('No challenge frame'); continue; }
-
-        const challengeText = await cf.evaluate(() => {
-          const prompt = document.querySelector('.prompt-text');
-          const body = document.body.innerText || '';
-          // The question is usually after the prompt, before the input
-          // Extract everything between the prompt header and the input/controls
-          return {
-            prompt: prompt?.textContent?.trim() || '',
-            bodyText: body.slice(0, 500),
-          };
-        }).catch(() => null);
-
-        if (!challengeText) { this.log('Could not read challenge'); continue; }
-        this.log('Prompt:', challengeText.prompt);
-
-        // Extract the actual question from bodyText
-        // Format: "Answer using digits only for the question below.\n\nQUESTION TEXT\n\nEN\n..."
-        const lines = challengeText.bodyText.split('\n').map(l => l.trim()).filter(Boolean);
-        // Find the question line (after prompt, before EN/Skip)
-        let question = '';
-        for (let i = 0; i < lines.length; i++) {
-          if (lines[i].startsWith('Answer') || lines[i].startsWith('Please')) continue;
-          if (lines[i] === 'EN' || lines[i] === 'Skip' || lines[i].includes('try again')) break;
-          if (lines[i].length > 10) {
-            question = lines[i];
-            break;
-          }
-        }
-
-        if (!question) {
-          this.log('Could not extract question from:', lines.slice(0, 5));
-          continue;
-        }
-
-        this.log('Question:', question);
-
-        // Solve it
-        const answer = solveTextChallenge(question);
-        if (!answer) {
-          this.log('Could not solve question — unsupported type');
-          continue;
-        }
-
-        this.log('Answer:', answer);
-
-        // Type the answer into the input field
-        const inputSel = 'input[type="text"], input:not([type]), textarea';
-        try {
-          await cf.waitForSelector(inputSel, { timeout: 3000 });
-          // Clear existing value first
-          await cf.evaluate((sel) => {
-            const el = document.querySelector(sel);
-            if (el) el.value = '';
-          }, inputSel);
-          await cf.fill(inputSel, answer);
-          this.log('Typed answer');
-        } catch (e) {
-          this.log('Could not find/fill input:', e.message);
-          continue;
-        }
-
-        // Submit — try clicking verify/submit/next button, fall back to Enter
+      // Open menu and click Accessibility Challenge — retry up to 3 times
+      let a11yActivated = false;
+      for (let menuAttempt = 0; menuAttempt < 3 && !a11yActivated; menuAttempt++) {
+        // Click the three-dot menu button (⋮) at bottom-left of challenge frame
+        // Anchors from DOM show it at iframe-relative (10, 523) size 35x35
+        await page.mouse.click(bb.x + 27, bb.y + 540);
+        // Also try the exact DOM anchor position as fallback
         await page.waitForTimeout(500);
+        // Check if modal appeared
+        const modalCheck = await (page.frames().find(f => f.url().includes('frame=challenge')))?.evaluate(() => {
+          const m = document.querySelector('.modal');
+          return m && m.offsetHeight > 50;
+        }).catch(() => false);
+        if (!modalCheck) {
+          // Try alternative click position
+          await page.mouse.click(bb.x + 12, bb.y + 530);
+        }
+        await page.waitForTimeout(1500);
         
-        // Look for submit button in the challenge frame
-        const submitClicked = await cf.evaluate(() => {
-          // Try various submit button selectors
-          const selectors = [
-            '.button-submit',
-            'button[type="submit"]',
-            '[aria-label*="Verify"]',
-            '[aria-label*="Submit"]',
-            '[title*="Verify"]',
-            '[title*="Submit"]',
-            '[title*="Next"]',
-          ];
-          for (const sel of selectors) {
-            const btn = document.querySelector(sel);
-            if (btn) {
-              btn.click();
-              return sel;
-            }
-          }
-          return null;
-        }).catch(() => null);
+        // Screenshot to verify menu opened
+        try { await iframeEl.screenshot({ path: `/tmp/a11y_menu_attempt_${menuAttempt}.png` }); } catch {}
 
-        if (submitClicked) {
-          this.log('Clicked submit button:', submitClicked);
-        } else {
-          // Fallback: click the "Skip" area which might now say "Verify" or "Next"
-          // The verify button is at bottom-right of iframe (~x=468, y=540)
-          this.log('Clicking verify button area...');
-          await page.mouse.click(bb.x + 468, bb.y + 540);
+        // Click "Accessibility Challenge" position
+        await page.mouse.click(bb.x + 135, bb.y + 352);
+        await page.waitForTimeout(3000);
+
+        // Check if text mode activated
+        const cf_chk = page.frames().find(f => f.url().includes('frame=challenge'));
+        if (cf_chk) {
+          try {
+            const hasText = await cf_chk.evaluate(() => {
+              const inp = document.querySelector('input[type="text"]');
+              const p = (document.querySelector('.prompt-text')?.textContent || '').toLowerCase();
+              return !!(inp?.offsetHeight > 0 && (p.includes('number') || p.includes('digit') || p.includes('answer') || p.includes('question')));
+            });
+            if (hasText) { a11yActivated = true; break; }
+          } catch {}
         }
-        this.log('Submitted');
+        this.log(`Menu attempt ${menuAttempt + 1} failed, retrying...`);
+      }
+      
+      if (!a11yActivated) {
+        try { await iframeEl.screenshot({ path: '/tmp/a11y_solver_debug.png' }); } catch {}
+      }
+      this.log(a11yActivated ? 'A11y mode active' : 'A11y mode FAILED', Date.now() - t0, 'ms');
+      // Wait for text challenge to appear — poll aggressively for up to 15s
+      const textReady = await this._poll(async () => {
+        const cf = page.frames().find(f => f.url().includes('frame=challenge'));
+        if (!cf) return null;
+        try {
+          const result = await cf.evaluate(() => {
+            const inp = document.querySelector('input[type="text"]');
+            const prompt = (document.querySelector('.prompt-text')?.textContent || '').toLowerCase();
+            const isText = prompt.includes('number') || prompt.includes('digit') || 
+              prompt.includes('answer') || prompt.includes('question') || prompt.includes('using only');
+            return inp && inp.offsetHeight > 0 && isText;
+          });
+          return result || null;
+        } catch { return null; }
+      }, 15000, 200);
 
-        // Wait for token
-        await page.waitForTimeout(5000);
+      if (!textReady) throw new Error('Text challenge did not load');
+      this.log('Text mode active', Date.now() - t0, 'ms');
 
-        if (!capturedToken) {
+      // Solve loop
+      for (let round = 0; round < 5; round++) {
+        if (token) break;
+        const pmTok = await page.evaluate(() => window.__hcToken).catch(() => null);
+        if (pmTok) { token = pmTok; break; }
+
+        const cf = page.frames().find(f => f.url().includes('frame=challenge'));
+        if (!cf) break;
+
+        const bodyText = await cf.evaluate(() => document.body.innerText || '').catch(() => '');
+        const lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
+
+        let question = '';
+        for (const line of lines) {
+          if (/^(answer|please|respond)/i.test(line) || line.length < 15) continue;
+          if (/^(EN|Skip|Next)$/i.test(line) || line.includes('try again')) break;
+          question = line; break;
+        }
+
+        if (!question) { await page.waitForTimeout(300); continue; }
+
+        const answer = solveTextChallenge(question);
+        if (!answer) { this.log('Unsupported:', question); await page.waitForTimeout(300); continue; }
+
+        this.log(`R${round + 1}: "${question.slice(0, 50)}..." → ${answer}`);
+
+        const sel = 'input[type="text"], textarea';
+        await cf.evaluate(s => { const e = document.querySelector(s); if (e) e.value = ''; }, sel);
+        await cf.fill(sel, answer);
+
+        // Click submit
+        const submitted = await cf.evaluate(() => {
+          const btn = document.querySelector('.button-submit');
+          if (btn) { btn.click(); return true; } return false;
+        }).catch(() => false);
+        if (!submitted) await page.mouse.click(bb.x + 468, bb.y + 540);
+
+        // Wait for token or new question
+        await this._poll(async () => {
+          if (token) return true;
           const t = await page.evaluate(() => window.__hcToken).catch(() => null);
-          if (t) capturedToken = t;
-        }
+          if (t) { token = t; return true; }
+          const newText = await cf.evaluate(() => document.body.innerText || '').catch(() => '');
+          return newText !== bodyText ? 'next' : null;
+        }, 5000, 150);
 
-        // Also check textarea value on the parent page
-        if (!capturedToken) {
-          const textareaVal = await page.evaluate(() => {
-            const el = document.querySelector('textarea[name="h-captcha-response"]');
-            return el?.value || null;
-          }).catch(() => null);
-          if (textareaVal && textareaVal.length > 10) capturedToken = textareaVal;
-        }
-
-        if (capturedToken) break;
-        this.log('No token yet — may need another challenge round');
+        if (token) break;
       }
 
-      if (!capturedToken) {
-        throw new Error('Failed to obtain token after 3 attempts');
+      if (!token) {
+        const tv = await page.evaluate(() =>
+          document.querySelector('textarea[name="h-captcha-response"]')?.value
+        ).catch(() => null);
+        if (tv?.length > 10) token = tv;
       }
 
-      return {
-        token: capturedToken,
-        elapsed: Date.now() - startTime,
-        type: 'a11y_text_challenge',
-      };
+      if (!token) throw new Error('No token after 5 rounds');
+      this.log(`Done in ${Date.now() - t0}ms`);
+      return { token, elapsed: Date.now() - t0, type: 'a11y_text_challenge' };
 
     } finally {
       await ctx.close().catch(() => {});
@@ -277,10 +233,7 @@ class A11yBrowserSolver {
   }
 
   async close() {
-    if (this._browser) {
-      await this._browser.close().catch(() => {});
-      this._browser = null;
-    }
+    if (this._browser) { await this._browser.close().catch(() => {}); this._browser = null; }
   }
 }
 
