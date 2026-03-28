@@ -6,6 +6,7 @@ const { solvePoW } = require('./pow');
 const { generateMotionData, generateAnswerMotionData } = require('./motion');
 const { BrowserSession } = require('./browser_session');
 const { AccessibilitySolver } = require('./accessibility_solver');
+const cookieStore = require('./a11y_cookie_store');
 
 const HCAPTCHA_API_DOMAIN = 'https://hcaptcha.com';
 const ASSET_DOMAIN = 'https://newassets.hcaptcha.com';
@@ -85,10 +86,17 @@ class HCaptchaSolver {
     this.timeout = options.timeout || 90000;
     this.debug = options.debug || false;
     this.proxy = options.proxy || '';
-    this.accessibilityCookie = options.accessibilityCookie || process.env.HC_ACCESSIBILITY_COOKIE || '';
+    // Cookie priority: explicit option > env var > disk store
+    this.accessibilityCookie = options.accessibilityCookie
+      || process.env.HC_ACCESSIBILITY_COOKIE
+      || cookieStore.load()
+      || '';
     this.client = new HCaptchaClient({ proxy: this.proxy });
     this._browser = null;
     this._a11ySolver = null;
+    if (this.accessibilityCookie) {
+      this.log('Accessibility cookie loaded — fast-path active');
+    }
   }
 
   log(...args) {
@@ -131,6 +139,12 @@ class HCaptchaSolver {
         return result;
       } catch (err) {
         this.log('Accessibility bypass failed:', err.message);
+        // If cookie is invalid/expired, clear it from disk so next startup re-registers
+        if (/invalid|expired|rejected|encrypted response/i.test(err.message)) {
+          this.log('Clearing stale cookie from disk');
+          cookieStore.clear();
+          this.accessibilityCookie = '';
+        }
         this.log('Falling back to standard path...');
       }
     }

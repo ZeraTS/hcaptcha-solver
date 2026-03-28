@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node src/server.js",
     "test": "node test_solver.js",
-    "test:real": "node test_solver.js --real"
+    "test:real": "node test_solver.js --real",
+    "a11y:setup": "node scripts/a11y_setup.js",
+    "a11y:status": "node scripts/a11y_setup.js --status",
+    "a11y:clear": "node scripts/a11y_setup.js --clear"
   },
   "dependencies": {
     "@xenova/transformers": "^2.17.2",

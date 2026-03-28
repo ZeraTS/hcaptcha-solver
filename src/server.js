@@ -2,6 +2,8 @@
 
 const http = require('http');
 const { HCaptchaSolver } = require('./solver');
+const cookieStore = require('./a11y_cookie_store');
+const { followMagicLink } = require('./a11y_register');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const API_KEY = process.env.HCAPTCHA_API_KEY || '';
@@ -75,6 +77,39 @@ const server = http.createServer(async (req, res) => {
       console.error('[server] Solver error:', err.message);
       return sendJSON(res, 500, { error: err.message });
     }
+  }
+
+  // GET /a11y/status — check accessibility cookie status
+  if (req.method === 'GET' && req.url === '/a11y/status') {
+    return sendJSON(res, 200, cookieStore.status());
+  }
+
+  // POST /a11y/cookie — manually set the accessibility cookie value
+  if (req.method === 'POST' && req.url === '/a11y/cookie') {
+    const body = await readBody(req);
+    const { cookie } = body;
+    if (!cookie) return sendJSON(res, 400, { error: 'Missing cookie field' });
+    cookieStore.save(cookie);
+    return sendJSON(res, 200, { ok: true, status: cookieStore.status() });
+  }
+
+  // POST /a11y/magic-link — follow magic link received in email, extract + save cookie
+  if (req.method === 'POST' && req.url === '/a11y/magic-link') {
+    const body = await readBody(req);
+    const { url } = body;
+    if (!url) return sendJSON(res, 400, { error: 'Missing url field' });
+    try {
+      const cookie = await followMagicLink(url, { debug: process.env.DEBUG === '1' });
+      return sendJSON(res, 200, { ok: true, status: cookieStore.status(), cookie: cookie.slice(0, 16) + '...' });
+    } catch (err) {
+      return sendJSON(res, 500, { error: err.message });
+    }
+  }
+
+  // POST /a11y/clear — remove cached cookie (forces re-register on next solve)
+  if (req.method === 'POST' && req.url === '/a11y/clear') {
+    cookieStore.clear();
+    return sendJSON(res, 200, { ok: true });
   }
 
   // POST /invalidate — placeholder for token invalidation tracking
