@@ -5,6 +5,7 @@ const { HCaptchaClient, USER_AGENT } = require('./tls_client');
 const { solvePoW } = require('./pow');
 const { generateMotionData, generateAnswerMotionData } = require('./motion');
 const { BrowserSession } = require('./browser_session');
+const { AccessibilitySolver } = require('./accessibility_solver');
 
 const HCAPTCHA_API_DOMAIN = 'https://hcaptcha.com';
 const ASSET_DOMAIN = 'https://newassets.hcaptcha.com';
@@ -84,8 +85,10 @@ class HCaptchaSolver {
     this.timeout = options.timeout || 90000;
     this.debug = options.debug || false;
     this.proxy = options.proxy || '';
+    this.accessibilityCookie = options.accessibilityCookie || process.env.HC_ACCESSIBILITY_COOKIE || '';
     this.client = new HCaptchaClient({ proxy: this.proxy });
     this._browser = null;
+    this._a11ySolver = null;
   }
 
   log(...args) {
@@ -113,28 +116,43 @@ class HCaptchaSolver {
     const sk = sitekey || this.sitekey;
     const h = host || this.host;
 
+    // Priority 1: Accessibility cookie bypass (pure HTTP, fastest)
+    if (this.accessibilityCookie) {
+      this.log('Trying accessibility cookie bypass...');
+      try {
+        if (!this._a11ySolver) {
+          this._a11ySolver = new AccessibilitySolver({
+            accessibilityCookie: this.accessibilityCookie,
+            debug: this.debug,
+          });
+        }
+        const result = await this._a11ySolver.solve(sk, h);
+        this.log('Accessibility bypass succeeded in', result.elapsed + 'ms');
+        return result;
+      } catch (err) {
+        this.log('Accessibility bypass failed:', err.message);
+        this.log('Falling back to standard path...');
+      }
+    }
+
+    // Priority 2: Standard path
     this.log('Fetching version...');
     const version = await getVersion();
     this.log('Version:', version);
 
-    // Step 1: checksiteconfig
     this.log('Checking site config...');
     const siteConfig = await checkSiteConfig(sk, h, version);
     this.log('Site config:', JSON.stringify(siteConfig).slice(0, 150));
 
     if (!siteConfig.pass) throw new Error(`Site config failed: ${JSON.stringify(siteConfig)}`);
 
-    // Check if this is a test/easy sitekey (no PoW, no enc_get_req)
-    const hasPoW = siteConfig.c && siteConfig.c.req;
     const hasEncGetReq = siteConfig.features && siteConfig.features.enc_get_req;
 
     if (!hasEncGetReq) {
-      // Pure-HTTP path — handles test sitekey and any plaintext sitekey
       this.log('Pure-HTTP path (no enc_get_req)');
       return this._solveHTTP(sk, h, version, siteConfig, startTime);
     }
 
-    // enc_get_req is on — must use browser path
     this.log('Browser path (enc_get_req=true)');
     return this._solveBrowser(sk, h, startTime);
   }

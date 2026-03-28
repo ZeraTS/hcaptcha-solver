@@ -52,7 +52,7 @@ const server = http.createServer(async (req, res) => {
   // POST /solve — solve a captcha
   if (req.method === 'POST' && req.url === '/solve') {
     const body = await readBody(req);
-    const { sitekey, host, proxy } = body;
+    const { sitekey, host, proxy, accessibilityCookie } = body;
 
     if (!sitekey || !host) {
       return sendJSON(res, 400, { error: 'Missing required fields: sitekey, host' });
@@ -62,6 +62,7 @@ const server = http.createServer(async (req, res) => {
       const s = new HCaptchaSolver({
         debug: process.env.DEBUG === '1',
         proxy: proxy || '',
+        accessibilityCookie: accessibilityCookie || process.env.HC_ACCESSIBILITY_COOKIE || '',
       });
       const result = await s.solve(sitekey, host);
       s.close();
